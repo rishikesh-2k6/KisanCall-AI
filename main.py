@@ -15,10 +15,11 @@
 # ============================================================
 
 from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse
 from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.rest import Client as TwilioClient
 
-from config import HOST, PORT
+from config import HOST, PORT, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, MY_PHONE_NUMBER
 from intent import detect_intent
 from weather import get_weather_for_place
 from llm import ask_llm
@@ -318,6 +319,110 @@ async def health_check():
 
 
 # ===========================================================
+# ENDPOINT 7: /call-me — Trigger outbound call to your phone
+# ===========================================================
+@app.get("/call-me")
+async def call_me_page():
+    """
+    Simple web page with a button to trigger a call.
+    Open http://localhost:8000/call-me in your browser.
+    """
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>KisanCall AI — Test Call</title>
+        <style>
+            body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee;
+                   display: flex; justify-content: center; align-items: center;
+                   min-height: 100vh; margin: 0; }
+            .card { background: #16213e; padding: 40px; border-radius: 16px;
+                    text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.3); }
+            h1 { color: #4ecca3; margin-bottom: 8px; }
+            p { color: #aaa; margin-bottom: 24px; }
+            button { background: #4ecca3; color: #1a1a2e; border: none;
+                     padding: 16px 48px; font-size: 18px; border-radius: 8px;
+                     cursor: pointer; font-weight: bold; }
+            button:hover { background: #3db88c; }
+            #status { margin-top: 20px; font-size: 14px; color: #4ecca3; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>🌾 KisanCall AI</h1>
+            <p>Click the button below — AI will call your phone!</p>
+            <button onclick="makeCall()">📞 Call Me Now</button>
+            <div id="status"></div>
+        </div>
+        <script>
+            async function makeCall() {
+                document.getElementById('status').innerText = '📞 Calling...';
+                try {
+                    const res = await fetch('/call-me/trigger', { method: 'POST' });
+                    const data = await res.json();
+                    if (data.success) {
+                        document.getElementById('status').innerText =
+                            '✅ Call initiated! Pick up your phone.';
+                    } else {
+                        document.getElementById('status').innerText =
+                            '❌ Error: ' + data.error;
+                    }
+                } catch (e) {
+                    document.getElementById('status').innerText = '❌ Server error';
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@app.post("/call-me/trigger")
+async def trigger_call(request: Request):
+    """
+    Triggers an outbound call from Twilio to your phone.
+    Twilio calls YOUR number, and when you pick up,
+    the /voice endpoint handles the conversation.
+    """
+    try:
+        # Determine the base URL for webhooks
+        # Use the Host header from the request (works with ngrok)
+        host = request.headers.get("host", f"localhost:{PORT}")
+        scheme = request.headers.get("x-forwarded-proto", "http")
+        base_url = f"{scheme}://{host}"
+
+        if not MY_PHONE_NUMBER or MY_PHONE_NUMBER == "+91XXXXXXXXXX":
+            return {
+                "success": False,
+                "error": "Set MY_PHONE_NUMBER in .env file first! (e.g., +919876543210)"
+            }
+
+        # Create Twilio client and make the call
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+        call = client.calls.create(
+            to=MY_PHONE_NUMBER,              # Your Indian phone number
+            from_=TWILIO_PHONE_NUMBER,        # Your Twilio US number
+            url=f"{base_url}/voice",          # Same webhook as incoming calls
+            status_callback=f"{base_url}/voice/status",
+        )
+
+        print(f"\n[Outbound Call] Calling {MY_PHONE_NUMBER}...")
+        print(f"[Outbound Call] Call SID: {call.sid}")
+
+        return {
+            "success": True,
+            "call_sid": call.sid,
+            "calling": MY_PHONE_NUMBER,
+        }
+
+    except Exception as e:
+        print(f"[Call Error] {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ===========================================================
 # Run the server
 # ===========================================================
 if __name__ == "__main__":
@@ -325,5 +430,6 @@ if __name__ == "__main__":
     print("=" * 50)
     print("  🌾 KisanCall AI v2.0 — Multilingual")
     print("  Languages: HI TE TA BN MR GU KN ML EN")
+    print(f"  Call-Me: http://localhost:{PORT}/call-me")
     print("=" * 50)
     uvicorn.run(app, host=HOST, port=PORT)
