@@ -428,7 +428,7 @@ async def trigger_call(request: Request):
 if __name__ == "__main__":
     import uvicorn
     print("=" * 50)
-    print("  🌾 KisanCall AI v2.0 — Multilingual")
+    print("  KisanCall AI v2.0 - Multilingual")
     print("  Languages: HI TE TA BN MR GU KN ML EN")
     print(f"  Call-Me: http://localhost:{PORT}/call-me")
     print("=" * 50)

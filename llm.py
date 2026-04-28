@@ -1,21 +1,26 @@
 # ============================================================
-# llm.py — Ollama Local LLM Integration
+# llm.py - Groq Cloud LLM Integration
 # ============================================================
-# Connects to a locally running Ollama server to generate
-# responses. Uses the Phi-3 model by default (small, fast).
+# Connects to Groq's ultra-fast inference API.
+# Uses Llama 3.1 8B Instant model (fast, free tier available).
 #
-# Ollama must be running: `ollama serve`
-# Model must be pulled: `ollama pull phi3`
+# Groq provides ~10x faster inference than local Ollama,
+# which is critical for real-time phone call responses.
+#
+# Get your API key at: https://console.groq.com
 # ============================================================
 
-import ollama as ollama_client
-from config import OLLAMA_MODEL
+import httpx
+from config import GROQ_API_KEY, GROQ_MODEL
 from prompts import SYSTEM_PROMPT
+
+# Groq API endpoint
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
 async def ask_llm(user_message: str, system_override: str = None) -> str:
     """
-    Send a message to the local Ollama LLM and get a response.
+    Send a message to Groq's LLM and get a response.
 
     Args:
         user_message:    The farmer's query (transcribed speech).
@@ -28,22 +33,35 @@ async def ask_llm(user_message: str, system_override: str = None) -> str:
     system_prompt = system_override or SYSTEM_PROMPT
 
     try:
-        # Call Ollama with the chat API
-        response = ollama_client.chat(
-            model=OLLAMA_MODEL,
-            messages=[
+        # Build the request payload (OpenAI-compatible format)
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            options={
-                "temperature": 0.7,    # Balanced creativity
-                "num_predict": 100,    # Limit tokens for short replies
-                "top_p": 0.9,
-            },
-        )
+            "temperature": 0.7,
+            "max_tokens": 150,       # Keep responses short for phone calls
+            "top_p": 0.9,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        # Make async HTTP request to Groq API
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                GROQ_API_URL,
+                json=payload,
+                headers=headers,
+            )
+            response.raise_for_status()
+            data = response.json()
 
         # Extract the response text
-        reply = response["message"]["content"].strip()
+        reply = data["choices"][0]["message"]["content"].strip()
 
         # Clean up for speech: remove markdown artifacts
         reply = reply.replace("*", "").replace("#", "").replace("_", "")
@@ -59,7 +77,7 @@ async def ask_llm(user_message: str, system_override: str = None) -> str:
 
     except Exception as e:
         print(f"[LLM Error] {e}")
-        # Fallback response if LLM is unavailable
+        # Fallback response if Groq API is unavailable
         return (
             "Maaf kijiye, abhi jawaab dene mein dikkat aa rahi hai. "
             "Kripya thodi der baad dobara call karein."
