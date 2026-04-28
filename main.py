@@ -1,18 +1,20 @@
 # ============================================================
-# main.py — FastAPI Application Entry Point for KisanCall AI
+# main.py — FastAPI Application for KisanCall AI (Multilingual)
 # ============================================================
 #
 # CALL FLOW:
 #   1. Farmer calls Twilio number
-#   2. Twilio sends webhook to /voice (initial greeting)
-#   3. AI greets and listens via <Gather>
+#   2. /voice → Language selection menu (press 1-9)
+#   3. /voice/language → Stores language, greets in chosen lang
 #   4. Farmer speaks → Twilio transcribes → POST /voice/respond
 #   5. Backend detects intent, calls LLM, returns TwiML
 #   6. Twilio speaks the response and listens again
 #
+# Supports: Hindi, Telugu, Tamil, Bengali, Marathi,
+#           Gujarati, Kannada, Malayalam, English
 # ============================================================
 
-from fastapi import FastAPI, Request, Form
+from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
@@ -20,63 +22,78 @@ from config import HOST, PORT
 from intent import detect_intent
 from weather import get_weather_for_place
 from llm import ask_llm
-from prompts import build_weather_prompt, SYSTEM_PROMPT
+from prompts import (
+    get_system_prompt, build_weather_prompt,
+    GREETINGS, LOCATION_ASK, LOCATION_NOT_FOUND,
+    GOODBYE, SILENCE_PROMPT,
+)
+from languages import (
+    get_language, get_language_by_dtmf,
+    build_language_menu_text, DEFAULT_LANGUAGE,
+)
 from session import get_session, clear_session
 
 # ── Create FastAPI App ───────────────────────────────────
 app = FastAPI(
     title="KisanCall AI",
-    description="Voice-based agricultural assistant for Indian farmers",
-    version="1.0.0",
+    description="Multilingual voice-based agricultural assistant for Indian farmers",
+    version="2.0.0",
 )
 
 
 # ===========================================================
-# ENDPOINT 1: /voice — Handles incoming calls (initial hook)
+# HELPER: Build TwiML <Say> with correct language/voice
 # ===========================================================
-@app.post("/voice", response_class=PlainTextResponse)
-async def handle_incoming_call(request: Request):
+def _say(response: VoiceResponse, text: str, lang_code: str = "hi"):
     """
-    Called by Twilio when a farmer dials the number.
-    Greets the user and starts listening for speech.
+    Add a <Say> element with the correct voice and language.
+
+    Uses Polly.Aditi for Hindi/English, basic TTS for others.
     """
-    # Get the unique call identifier from Twilio
-    form_data = await request.form()
-    call_sid = form_data.get("CallSid", "unknown")
+    lang_config = get_language(lang_code)
+    voice = lang_config.get("tts_voice")
+    tts_lang = lang_config.get("tts_lang", "hi-IN")
 
-    # Create a fresh session for this call
-    session = get_session(call_sid)
-    session.is_first_turn = True
+    if voice:
+        response.say(text, voice=voice, language=tts_lang)
+    else:
+        # For languages without a Polly voice, use basic TTS
+        response.say(text, language=tts_lang)
 
-    # Build TwiML response
+
+def _build_listen_response(text: str, lang_code: str = "hi") -> PlainTextResponse:
+    """
+    Creates a TwiML response that:
+      1. Speaks the AI's reply in the farmer's language
+      2. Starts listening for the next question
+
+    Args:
+        text:      The AI's response to speak.
+        lang_code: The farmer's selected language code.
+
+    Returns:
+        PlainTextResponse with TwiML XML.
+    """
+    lang_config = get_language(lang_code)
+    stt_code = lang_config.get("stt_code", "hi-IN")
+
     response = VoiceResponse()
 
-    # Greet the farmer warmly
-    response.say(
-        "Namaste! Main aapka Kisan Mitra hoon. "
-        "Aap mujhse kheti, mausam, ya fasal ke baare mein kuch bhi pooch sakte hain. "
-        "Boliye, main sun raha hoon.",
-        voice="Polly.Aditi",   # Hindi voice
-        language="hi-IN",
-    )
+    # Speak the AI's response
+    _say(response, text, lang_code)
 
-    # Start listening for the farmer's speech
+    # Listen for the next question in the farmer's language
     gather = Gather(
         input="speech",
-        language="hi-IN",           # Recognize Hindi speech
-        speech_timeout="auto",      # Auto-detect end of speech
-        action="/voice/respond",    # Where to send the transcription
+        language=stt_code,
+        speech_timeout="auto",
+        action="/voice/respond",
         method="POST",
     )
     response.append(gather)
 
-    # If farmer doesn't say anything, prompt again
-    response.say(
-        "Kya aap sun sakte hain? Kripya apna sawaal bolein.",
-        voice="Polly.Aditi",
-        language="hi-IN",
-    )
-    response.redirect("/voice")  # Try again
+    # If silence, say goodbye
+    _say(response, GOODBYE.get(lang_code, GOODBYE["hi"]), lang_code)
 
     return PlainTextResponse(
         content=str(response),
@@ -85,13 +102,118 @@ async def handle_incoming_call(request: Request):
 
 
 # ===========================================================
-# ENDPOINT 2: /voice/respond — Processes farmer's speech
+# ENDPOINT 1: /voice — Language Selection Menu
+# ===========================================================
+@app.post("/voice", response_class=PlainTextResponse)
+async def handle_incoming_call(request: Request):
+    """
+    Called by Twilio when a farmer dials the number.
+    Plays a language selection menu (press 1-9).
+    """
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid", "unknown")
+
+    # Create a fresh session
+    session = get_session(call_sid)
+    session.is_first_turn = True
+
+    response = VoiceResponse()
+
+    # Play language selection menu
+    # Use Gather with DTMF input (keypad presses)
+    gather = Gather(
+        input="dtmf",
+        num_digits=1,
+        timeout=10,
+        action="/voice/language",
+        method="POST",
+    )
+    gather.say(
+        build_language_menu_text(),
+        voice="Polly.Aditi",
+        language="hi-IN",
+    )
+    response.append(gather)
+
+    # If no input, default to Hindi
+    response.say(
+        "Koi button nahi daba, Hindi mein madad karunga.",
+        voice="Polly.Aditi",
+        language="hi-IN",
+    )
+    response.redirect("/voice/default-hindi", method="POST")
+
+    return PlainTextResponse(
+        content=str(response),
+        media_type="application/xml",
+    )
+
+
+# ===========================================================
+# ENDPOINT 2: /voice/language — Handle Language Selection
+# ===========================================================
+@app.post("/voice/language", response_class=PlainTextResponse)
+async def handle_language_selection(request: Request):
+    """
+    Called after the farmer presses a digit to select language.
+    Stores the language and greets in the chosen language.
+    """
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid", "unknown")
+    digit = form_data.get("Digits", "1")
+
+    # Look up the language by keypad digit
+    lang_config = get_language_by_dtmf(digit)
+    if not lang_config:
+        # Invalid digit — default to Hindi
+        lang_config = get_language(DEFAULT_LANGUAGE)
+        lang_config["code"] = DEFAULT_LANGUAGE
+
+    lang_code = lang_config["code"]
+
+    # Store language in session
+    session = get_session(call_sid)
+    session.language = lang_code
+    session.language_selected = True
+
+    print(f"[Call {call_sid}] Language selected: {lang_config['name']} ({lang_code})")
+
+    # Greet in the chosen language and start listening
+    greeting = GREETINGS.get(lang_code, GREETINGS["hi"])
+    return _build_listen_response(greeting, lang_code)
+
+
+# ===========================================================
+# ENDPOINT 3: /voice/default-hindi — Fallback to Hindi
+# ===========================================================
+@app.post("/voice/default-hindi", response_class=PlainTextResponse)
+async def handle_default_hindi(request: Request):
+    """
+    Fallback when farmer doesn't press any digit.
+    Defaults to Hindi and starts listening.
+    """
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid", "unknown")
+
+    session = get_session(call_sid)
+    session.language = "hi"
+    session.language_selected = True
+
+    print(f"[Call {call_sid}] No language selected, defaulting to Hindi")
+
+    greeting = GREETINGS["hi"]
+    return _build_listen_response(greeting, "hi")
+
+
+# ===========================================================
+# ENDPOINT 4: /voice/respond — Processes farmer's speech
 # ===========================================================
 @app.post("/voice/respond", response_class=PlainTextResponse)
 async def handle_speech(request: Request):
     """
     Called by Twilio after the farmer speaks.
-    Processes speech, detects intent, generates response.
+    Processes speech, detects intent, generates response
+    in the farmer's selected language.
     """
     form_data = await request.form()
 
@@ -99,15 +221,15 @@ async def handle_speech(request: Request):
     user_speech = form_data.get("SpeechResult", "")
     call_sid = form_data.get("CallSid", "unknown")
 
-    print(f"\n[Call {call_sid}] Farmer said: \"{user_speech}\"")
-
-    # Get the session for this call
+    # Get the session and language
     session = get_session(call_sid)
+    lang = session.language
     session.is_first_turn = False
+
+    print(f"\n[Call {call_sid}] [{lang}] Farmer said: \"{user_speech}\"")
 
     # ── Step 1: Check if this is a follow-up (location answer) ──
     if session.pending_intent == "weather_needs_location":
-        # The farmer is providing their location
         location_name = user_speech.strip()
         print(f"[Call {call_sid}] Location received: {location_name}")
 
@@ -115,28 +237,25 @@ async def handle_speech(request: Request):
         weather_data = await get_weather_for_place(location_name)
 
         if weather_data:
-            # Build a prompt with real weather data
+            # Build a prompt with real weather data in the right language
+            system_prompt = get_system_prompt(lang)
             weather_prompt = build_weather_prompt(
-                session.pending_query, weather_data
+                session.pending_query, weather_data, lang
             )
             ai_reply = await ask_llm(
                 user_message=session.pending_query,
-                system_override=SYSTEM_PROMPT + "\n\n" + weather_prompt,
+                system_override=system_prompt + "\n\n" + weather_prompt,
             )
         else:
-            ai_reply = (
-                "Maaf kijiye, yeh jagah nahi mil rahi. "
-                "Kripya apne shehar ya district ka naam bataiye."
-            )
-            # Keep waiting for location
-            return _build_listen_response(ai_reply)
+            ai_reply = LOCATION_NOT_FOUND.get(lang, LOCATION_NOT_FOUND["hi"])
+            return _build_listen_response(ai_reply, lang)
 
         # Clear the pending state
         session.pending_intent = None
         session.pending_query = None
 
         print(f"[Call {call_sid}] AI reply: \"{ai_reply}\"")
-        return _build_listen_response(ai_reply)
+        return _build_listen_response(ai_reply, lang)
 
     # ── Step 2: Detect intent from speech ────────────────────
     intent = detect_intent(user_speech)
@@ -144,24 +263,26 @@ async def handle_speech(request: Request):
 
     # ── Step 3: Handle weather intent ────────────────────────
     if intent == "weather":
-        # We need the farmer's location for weather data
-        # Save the query and ask for location
         session.pending_intent = "weather_needs_location"
         session.pending_query = user_speech
 
-        ai_reply = "Mausam jaanne ke liye aapka gaon ya shehar ka naam bataiye."
-        print(f"[Call {call_sid}] Asking for location...")
-        return _build_listen_response(ai_reply)
+        ai_reply = LOCATION_ASK.get(lang, LOCATION_ASK["hi"])
+        print(f"[Call {call_sid}] Asking for location in {lang}...")
+        return _build_listen_response(ai_reply, lang)
 
     # ── Step 4: Handle general agriculture queries ───────────
-    ai_reply = await ask_llm(user_message=user_speech)
+    system_prompt = get_system_prompt(lang)
+    ai_reply = await ask_llm(
+        user_message=user_speech,
+        system_override=system_prompt,
+    )
     print(f"[Call {call_sid}] AI reply: \"{ai_reply}\"")
 
-    return _build_listen_response(ai_reply)
+    return _build_listen_response(ai_reply, lang)
 
 
 # ===========================================================
-# ENDPOINT 3: /voice/status — Call status callback
+# ENDPOINT 5: /voice/status — Call status callback
 # ===========================================================
 @app.post("/voice/status")
 async def handle_call_status(request: Request):
@@ -182,59 +303,18 @@ async def handle_call_status(request: Request):
 
 
 # ===========================================================
-# ENDPOINT 4: /health — Health check
+# ENDPOINT 6: /health — Health check
 # ===========================================================
 @app.get("/health")
 async def health_check():
     """Simple health check for monitoring."""
-    return {"status": "ok", "service": "KisanCall AI"}
-
-
-# ===========================================================
-# HELPER: Build TwiML response that speaks and listens again
-# ===========================================================
-def _build_listen_response(text: str) -> PlainTextResponse:
-    """
-    Creates a TwiML response that:
-      1. Speaks the AI's reply
-      2. Starts listening for the next question
-
-    Args:
-        text: The AI's response to speak.
-
-    Returns:
-        PlainTextResponse with TwiML XML.
-    """
-    response = VoiceResponse()
-
-    # Speak the AI's response
-    response.say(
-        text,
-        voice="Polly.Aditi",   # Hindi voice
-        language="hi-IN",
-    )
-
-    # Listen for the next question
-    gather = Gather(
-        input="speech",
-        language="hi-IN",
-        speech_timeout="auto",
-        action="/voice/respond",
-        method="POST",
-    )
-    response.append(gather)
-
-    # If silence, say goodbye
-    response.say(
-        "Dhanyavaad! Agar aur koi sawaal ho toh dubara call karein. Namaste!",
-        voice="Polly.Aditi",
-        language="hi-IN",
-    )
-
-    return PlainTextResponse(
-        content=str(response),
-        media_type="application/xml",
-    )
+    return {
+        "status": "ok",
+        "service": "KisanCall AI",
+        "version": "2.0.0",
+        "multilingual": True,
+        "languages": ["hi", "te", "ta", "bn", "mr", "gu", "kn", "ml", "en"],
+    }
 
 
 # ===========================================================
@@ -243,6 +323,7 @@ def _build_listen_response(text: str) -> PlainTextResponse:
 if __name__ == "__main__":
     import uvicorn
     print("=" * 50)
-    print("  🌾 KisanCall AI — Starting Server")
+    print("  🌾 KisanCall AI v2.0 — Multilingual")
+    print("  Languages: HI TE TA BN MR GU KN ML EN")
     print("=" * 50)
     uvicorn.run(app, host=HOST, port=PORT)

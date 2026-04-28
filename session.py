@@ -1,9 +1,8 @@
 # ============================================================
-# session.py — Simple In-Memory Call Session Manager
+# session.py — In-Memory Call Session Manager (Multilingual)
 # ============================================================
-# Tracks conversation state per phone call so the AI can
-# remember context (e.g., the farmer asked about weather,
-# then provided their location on the next turn).
+# Tracks conversation state per phone call including the
+# farmer's selected language, pending queries, and history.
 #
 # Uses Twilio's CallSid as the unique session key.
 # ============================================================
@@ -19,6 +18,10 @@ _sessions: dict[str, "CallSession"] = {}
 class CallSession:
     """Tracks state for a single phone call."""
     call_sid: str
+    # Selected language code (e.g., "hi", "te", "ta")
+    language: str = "hi"
+    # Whether language has been selected yet
+    language_selected: bool = False
     # What the farmer is asking about
     pending_intent: Optional[str] = None
     # The original query (stored while we ask follow-ups)
